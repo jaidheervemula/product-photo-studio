@@ -1,0 +1,173 @@
+"""Image-processing core for Product Photo Studio.
+
+Kept free of Streamlit code so it can be tested and reused on its own.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageOps
+
+
+@dataclass(frozen=True)
+class Preset:
+    size: tuple[int, int]
+    fill: float  # share of the frame the product may occupy
+    force_white: bool = False
+    note: str = ""
+
+
+PRESETS = {
+    "Marketplace main image (2000×2000)": Preset(
+        (2000, 2000), 0.85, True,
+        "Pure white background with the product filling about 85% of the frame, "
+        "the main-image style marketplaces like Amazon ask for.",
+    ),
+    "Shopify / website (2048×2048)": Preset(
+        (2048, 2048), 0.78, note="Square image with breathing room for store product pages."
+    ),
+    "Instagram post (1080×1350)": Preset(
+        (1080, 1350), 0.68, note="Portrait 4:5, the format that takes up the most space in the feed."
+    ),
+    "Instagram story (1080×1920)": Preset(
+        (1080, 1920), 0.55, note="Full-screen 9:16 with room for text and stickers."
+    ),
+    "Square (1024×1024)": Preset((1024, 1024), 0.76, note="General-purpose square image."),
+}
+
+SHADOWS = ["None", "Soft contact shadow", "Drop shadow", "Floor reflection"]
+
+
+def hex_to_rgb(value: str) -> tuple[int, int, int]:
+    v = value.strip().lstrip("#")
+    if len(v) == 3:
+        v = "".join(c * 2 for c in v)
+    if len(v) != 6:
+        raise ValueError(f"Not a hex colour: {value!r}")
+    return tuple(int(v[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _gradient(size, inner, outer, radial=False):
+    """Smooth two-colour backdrop: top-to-bottom, or centre-to-edge if radial."""
+    grad = Image.radial_gradient("L") if radial else Image.linear_gradient("L")
+    mask = grad.resize(size, Image.BICUBIC)
+    return Image.composite(Image.new("RGB", size, outer), Image.new("RGB", size, inner), mask)
+
+
+BACKDROPS = {
+    "Pure white": lambda s: Image.new("RGB", s, (255, 255, 255)),
+    "Studio grey": lambda s: _gradient(s, (250, 250, 250), (206, 207, 212)),
+    "Spotlight": lambda s: _gradient(s, (255, 255, 255), (196, 198, 206), radial=True),
+    "Warm beige": lambda s: _gradient(s, (248, 242, 233), (226, 211, 192)),
+    "Soft pastel": lambda s: _gradient(s, (240, 243, 255), (252, 233, 243)),
+    "Luxury dark": lambda s: _gradient(s, (74, 74, 84), (14, 14, 18), radial=True),
+}
+
+
+def make_backdrop(name: str, size: tuple[int, int], custom_color: str = "#ffffff") -> Image.Image:
+    if name == "Custom colour":
+        return Image.new("RGB", size, hex_to_rgb(custom_color))
+    return BACKDROPS[name](size)
+
+
+def remove_background(image: Image.Image, session, max_side: int = 2000) -> Image.Image:
+    """Cut the product out with AI and trim to its bounds. Returns an RGBA image."""
+    from rembg import remove  # imported here so the rest of the module stays lightweight
+
+    image = ImageOps.exif_transpose(image).convert("RGBA")  # fix rotated phone photos
+    image.thumbnail((max_side, max_side))
+    cutout = remove(image, session=session)
+    solid = cutout.getchannel("A").point(lambda v: 255 if v > 20 else 0)
+    bbox = solid.getbbox()
+    if bbox is None:
+        raise ValueError("Couldn't find a product in this photo. Try one with a clearer subject.")
+    return cutout.crop(bbox)
+
+
+def refine_edges(img: Image.Image) -> Image.Image:
+    """Shrink the mask by a pixel and soften it to remove background halos."""
+    r, g, b, a = img.split()
+    a = a.filter(ImageFilter.MinFilter(3)).filter(ImageFilter.GaussianBlur(0.7))
+    return Image.merge("RGBA", (r, g, b, a))
+
+
+def enhance_product(img: Image.Image) -> Image.Image:
+    alpha = img.getchannel("A")
+    rgb = img.convert("RGB")
+    rgb = ImageEnhance.Contrast(rgb).enhance(1.08)
+    rgb = ImageEnhance.Color(rgb).enhance(1.06)
+    rgb = ImageEnhance.Sharpness(rgb).enhance(1.25)
+    rgb.putalpha(alpha)
+    return rgb
+
+
+def _contact_shadow(canvas, x, y, pw, ph):
+    layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    sw, sh = int(pw * 0.85), max(8, int(min(pw, ph) * 0.08))
+    sx, sy = x + (pw - sw) // 2, y + ph - sh // 2
+    draw.ellipse([sx, sy, sx + sw, sy + sh], fill=(0, 0, 0, 120))
+    blur = max(4, int(canvas.width * 0.012))
+    canvas.alpha_composite(layer.filter(ImageFilter.GaussianBlur(blur)))
+
+
+def _drop_shadow(canvas, product, x, y):
+    w, h = canvas.size
+    shadow = Image.new("RGBA", product.size, (0, 0, 0, 0))
+    shadow.putalpha(product.getchannel("A").point(lambda v: int(v * 0.35)))
+    layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    layer.paste(shadow, (x + int(w * 0.012), y + int(h * 0.015)))
+    canvas.alpha_composite(layer.filter(ImageFilter.GaussianBlur(max(4, int(w * 0.01)))))
+
+
+def _reflection(canvas, product, x, y):
+    top = y + product.height
+    refl_h = min(int(product.height * 0.35), canvas.height - top)
+    if refl_h <= 0:
+        return
+    flipped = ImageOps.flip(product).crop((0, 0, product.width, refl_h))
+    fade = Image.linear_gradient("L").resize((product.width, refl_h))
+    fade = ImageOps.invert(fade).point(lambda v: int(v * 0.30))
+    flipped.putalpha(ImageChops.multiply(flipped.getchannel("A"), fade))
+    canvas.alpha_composite(flipped, (x, top))
+
+
+def compose(
+    cutout: Image.Image,
+    preset: Preset,
+    backdrop: str = "Pure white",
+    custom_color: str = "#ffffff",
+    fill: float | None = None,
+    shadow: str = "Soft contact shadow",
+    enhance: bool = True,
+    clean_edges: bool = True,
+) -> Image.Image:
+    """Place a cut-out product on a backdrop, framed for the chosen export preset."""
+    W, H = preset.size
+    fill = preset.fill if fill is None else fill
+
+    product = cutout.convert("RGBA")
+    scale = min(W * fill / product.width, H * fill / product.height)
+    pw, ph = max(1, round(product.width * scale)), max(1, round(product.height * scale))
+    product = product.resize((pw, ph), Image.LANCZOS)
+    if clean_edges:
+        product = refine_edges(product)
+    if enhance:
+        product = enhance_product(product)
+
+    x, y = (W - pw) // 2, (H - ph) // 2
+    if shadow == "Floor reflection":
+        y = max(0, y - int(ph * 0.12))  # lift the product to make room for the reflection
+
+    canvas = make_backdrop("Pure white" if preset.force_white else backdrop, (W, H), custom_color)
+    canvas = canvas.convert("RGBA")
+
+    if shadow == "Soft contact shadow":
+        _contact_shadow(canvas, x, y, pw, ph)
+    elif shadow == "Drop shadow":
+        _drop_shadow(canvas, product, x, y)
+    elif shadow == "Floor reflection":
+        _reflection(canvas, product, x, y)
+
+    canvas.alpha_composite(product, (x, y))
+    return canvas.convert("RGB")
