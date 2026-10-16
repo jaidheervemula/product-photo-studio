@@ -99,52 +99,71 @@ def ai_mask(image: Image.Image, session) -> Image.Image:
     return _fit_mask(remove(image, session=session, only_mask=True), image.size)
 
 
-def click_mask(image: Image.Image, base: Image.Image, points, work_side: int = 640) -> Image.Image:
+def click_mask(image: Image.Image, base: Image.Image, points, work_side: int = 480) -> Image.Image:
     """Turn the user's clicks into a selection with random-walker segmentation.
 
     Clicks are seeds: label 1 = keep, 0 = remove. Everything outside the AI mask is
     also seeded as "remove". The random walker spreads the seeds across the photo and
     stops at strong colour edges, which separates touching objects (a book and a mouse).
-    It runs on a downscaled copy, so it is fast and needs no extra model download.
+    For speed it only works on the area around the product and the clicks, downscaled.
     """
     import numpy as np
     from scipy import ndimage
     from skimage.segmentation import random_walker
 
     w, h = image.size
-    s = min(1.0, work_side / max(w, h))
-    sw, sh = max(1, round(w * s)), max(1, round(h * s))
-    small = np.asarray(image.convert("RGB").resize((sw, sh), Image.BILINEAR), dtype=np.float64) / 255.0
-    foreground = np.asarray(base.convert("L").resize((sw, sh), Image.BILINEAR)) > 30
+    base = base.convert("L")
 
+    # 1) Crop to the product area plus the clicks: far fewer pixels, much faster.
+    bbox = base.point(lambda v: 255 if v > 30 else 0).getbbox() or (0, 0, w, h)
+    xs = [int(p[0]) for p in points]
+    ys = [int(p[1]) for p in points]
+    pad = int(max(w, h) * 0.03)
+    x0 = max(0, min([bbox[0]] + xs) - pad)
+    y0 = max(0, min([bbox[1]] + ys) - pad)
+    x1 = min(w, max([bbox[2]] + [x + 1 for x in xs]) + pad)
+    y1 = min(h, max([bbox[3]] + [y + 1 for y in ys]) + pad)
+    crop_img = image.convert("RGB").crop((x0, y0, x1, y1))
+    crop_base = base.crop((x0, y0, x1, y1))
+
+    # 2) Downscale the crop for the solver.
+    cw, ch = crop_img.size
+    s = min(1.0, work_side / max(cw, ch))
+    sw, sh = max(1, round(cw * s)), max(1, round(ch * s))
+    small = np.asarray(crop_img.resize((sw, sh), Image.BILINEAR), dtype=np.float64) / 255.0
+    foreground = np.asarray(crop_base.resize((sw, sh), Image.BILINEAR)) > 30
+
+    # 3) Seeds: background outside the AI mask, plus a small disk at every click.
     seeds = np.zeros((sh, sw), dtype=np.int32)
-    seeds[~foreground] = 2  # outside the AI mask is background for sure
+    seeds[~foreground] = 2
     yy, xx = np.mgrid[0:sh, 0:sw]
     radius = max(3, int(max(sw, sh) * 0.02))
     keep_spots = []
     for x, y, label in points:
-        cx, cy = x * s, y * s
+        cx, cy = (x - x0) * s, (y - y0) * s
         seeds[(xx - cx) ** 2 + (yy - cy) ** 2 <= radius ** 2] = 1 if label == 1 else 2
         if label == 1:
-            keep_spots.append((min(sh - 1, int(cy)), min(sw - 1, int(cx))))
+            keep_spots.append((min(sh - 1, max(0, int(cy))), min(sw - 1, max(0, int(cx)))))
 
     if not (seeds == 1).any():
-        return base.convert("L")
+        return base
     if (seeds == 0).any() and (seeds == 2).any():
         seg = random_walker(small, seeds, beta=130, mode="cg_j", channel_axis=-1)
     else:
         seg = np.where(seeds == 2, 2, 1)
     selected = seg == 1
 
-    # Keep only the regions that actually contain a "keep" click.
+    # 4) Keep only the regions that actually contain a "keep" click.
     regions, _ = ndimage.label(selected)
     keep_ids = {int(regions[r, c]) for r, c in keep_spots} - {0}
     if keep_ids:
         selected = np.isin(regions, list(keep_ids))
 
-    mask = Image.fromarray((selected * 255).astype(np.uint8), mode="L")
-    mask = mask.resize((w, h), Image.BILINEAR)  # smooth upscale; thresholded later
-    return mask
+    # 5) Scale back up and place the result into a full-size mask.
+    crop_mask = Image.fromarray((selected * 255).astype(np.uint8), mode="L").resize((cw, ch), Image.BILINEAR)
+    full = Image.new("L", (w, h), 0)
+    full.paste(crop_mask, (x0, y0))
+    return full
 
 
 def combine_masks(base: Image.Image, selection: Image.Image, grow_out: int = 4, grow_in: int = 8) -> Image.Image:
