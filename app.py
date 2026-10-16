@@ -70,6 +70,15 @@ def load_working(data: bytes) -> Image.Image:
     return Image.open(io.BytesIO(working_png(data))).convert("RGB")
 
 
+@st.cache_data(show_spinner=False, max_entries=20)
+def preview_png(data: bytes) -> tuple[bytes, float]:
+    """Small copy of the photo for the click picker, plus its scale factor."""
+    working = load_working(data)
+    preview = working.copy()
+    preview.thumbnail((PREVIEW_SIDE, PREVIEW_SIDE))
+    return encode(preview, "PNG"), working.width / preview.width
+
+
 @st.cache_data(show_spinner=False, max_entries=40)
 def matte_png(data: bytes, model_name: str) -> tuple[bytes, float]:
     start = time.perf_counter()
@@ -262,19 +271,23 @@ def compare_slider(before: Image.Image, after: Image.Image, animate: bool, heigh
 
 
 # ---------- Click to select ----------
-def point_picker(data: bytes, digest: str, pts: list) -> None:
-    with st.expander("🎯 Not quite right? Pick your product", expanded=bool(pts)):
+# A fragment reruns on its own: clicking only redraws the picker, not the whole app.
+@st.fragment
+def point_picker(data: bytes, digest: str) -> None:
+    drafts = st.session_state.setdefault("points", {})
+    applied_all = st.session_state.setdefault("applied", {})
+    pts = drafts.setdefault(digest, [])
+    applied = applied_all.get(digest, ())
+
+    with st.expander("🎯 Not quite right? Pick your product", expanded=bool(pts or applied)):
         st.caption(
-            "Click the product to keep it. Switch to Remove and click anything that should go, "
-            "like a hand or another object. The selection follows the edges in your photo."
+            "1. Click the product with ➕ Keep.  2. Switch to ➖ Remove and click anything that "
+            "should go, like a hand or another object.  3. Press ✨ Apply selection."
         )
         mode = st.radio("Click mode", ["➕ Keep", "➖ Remove"], horizontal=True, key="click_mode")
 
-        working = load_working(data)
-        preview = working.copy()
-        preview.thumbnail((PREVIEW_SIDE, PREVIEW_SIDE))
-        scale = working.width / preview.width
-
+        preview_bytes, scale = preview_png(data)
+        preview = Image.open(io.BytesIO(preview_bytes)).convert("RGB")
         draw = ImageDraw.Draw(preview)
         for x, y, label in pts:
             px, py, r = x / scale, y / scale, 8
@@ -289,19 +302,28 @@ def point_picker(data: bytes, digest: str, pts: list) -> None:
                 st.session_state["last_click"] = spot
                 label = 1 if mode.startswith("➕") else 0
                 pts.append((int(click["x"] * scale), int(click["y"] * scale), label))
-                st.rerun()
+                st.rerun(scope="fragment")  # redraw only the picker: instant
 
-        c1, c2 = st.columns(2)
-        if c1.button("Undo last point", disabled=not pts, key="undo_point"):
+        has_keep = any(p[2] == 1 for p in pts)
+        changed = tuple(pts) != tuple(applied)
+        if pts and not has_keep:
+            st.info("Add at least one ➕ Keep point on the product.")
+        elif changed and pts:
+            st.caption("You have points that aren't applied yet.")
+
+        c1, c2, c3 = st.columns(3)
+        if c1.button("✨ Apply selection", type="primary", disabled=not (has_keep and changed), key="apply_points"):
+            applied_all[digest] = tuple(pts)
+            st.rerun()  # full rerun: rebuild the cut-out with the new selection
+        if c2.button("Undo last point", disabled=not pts, key="undo_point"):
             pts.pop()
             st.session_state["click_nonce"] = nonce + 1
-            st.rerun()
-        if c2.button("Clear all points", disabled=not pts, key="clear_points"):
+            st.rerun(scope="fragment")
+        if c3.button("Reset to automatic", disabled=not (pts or applied), key="reset_points"):
             pts.clear()
+            applied_all[digest] = ()
             st.session_state["click_nonce"] = nonce + 1
             st.rerun()
-        if pts and not any(p[2] == 1 for p in pts):
-            st.info("Add at least one ➕ Keep point on the product.")
 
 
 load_css()
@@ -387,8 +409,8 @@ with single_tab:
     else:
         data = up.getvalue()
         digest = hashlib.md5(data).hexdigest()
-        pts = st.session_state.setdefault("points", {}).setdefault(digest, [])
-        active = tuple(pts) if any(p[2] == 1 for p in pts) else ()
+        applied = st.session_state.setdefault("applied", {}).get(digest, ())
+        active = tuple(applied) if any(p[2] == 1 for p in applied) else ()
 
         cut_bytes = None
         try:
@@ -416,7 +438,7 @@ with single_tab:
             m1, m2, m3 = st.columns(3)
             m1.metric("AI cut-out time", f"{secs:.1f} s")
             m2.metric("Output size", f"{result.width} × {result.height}")
-            m3.metric("Selection", f"{len(pts)} point(s)" if active else "Automatic")
+            m3.metric("Selection", f"{len(active)} point(s)" if active else "Automatic")
 
             d1, d2 = st.columns(2)
             d1.download_button(
@@ -427,7 +449,7 @@ with single_tab:
                 "Transparent cut-out (PNG)", cut_bytes, file_name="cutout.png", mime="image/png",
             )
 
-        point_picker(data, digest, pts)
+        point_picker(data, digest)
 
 # ---------- Batch mode ----------
 with batch_tab:
@@ -490,11 +512,11 @@ with about_tab:
     html('<div class="section-title">Engineering notes.</div>')
     st.markdown(
         "- Every AI step is **cached per photo**, so changing settings re-renders instantly.\n"
+        "- The click picker runs as an **isolated fragment**, so points appear instantly without re-running the app.\n"
         "- Click-to-select uses a **lightweight graph algorithm instead of a 350 MB model**, "
         "so it runs comfortably on a free CPU server.\n"
         "- Cut-outs are rebuilt from the **original colours plus the mask**, avoiding dark edge fringes.\n"
-        "- Image logic lives in `studio.py`, separate from the UI, so it can be tested and reused.\n"
-        "- Animations switch off automatically for users who prefer reduced motion."
+        "- Image logic lives in `studio.py`, separate from the UI, so it can be tested and reused."
     )
     html(
         '<div class="section-title">Built with.</div><div>'
