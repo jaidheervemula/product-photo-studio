@@ -3,3 +3,4 @@ rembg[cpu]
 pillow
 numpy
 scipy
+streamlit-image-coordinates
