@@ -78,8 +78,10 @@ def matte_png(data: bytes, model_name: str) -> tuple[bytes, float]:
 
 
 @st.cache_data(show_spinner=False, max_entries=40)
-def sam_png(data: bytes, points: tuple) -> bytes:
-    return encode(studio.sam_mask(load_working(data), get_session("sam"), points), "PNG")
+def click_png(data: bytes, model_name: str, points: tuple) -> bytes:
+    mask_bytes, _ = matte_png(data, model_name)
+    base = Image.open(io.BytesIO(mask_bytes)).convert("L")
+    return encode(studio.click_mask(load_working(data), base, points), "PNG")
 
 
 @st.cache_data(show_spinner=False, max_entries=40)
@@ -88,7 +90,7 @@ def build_cutout(data: bytes, model_name: str, main_only: bool, points: tuple) -
     mask_bytes, secs = matte_png(data, model_name)
     mask = Image.open(io.BytesIO(mask_bytes)).convert("L")
     if points:
-        selection = Image.open(io.BytesIO(sam_png(data, points))).convert("L")
+        selection = Image.open(io.BytesIO(click_png(data, model_name, points))).convert("L")
         mask = studio.combine_masks(mask, selection)
     cutout = studio.to_cutout(load_working(data), mask)
     cutout = studio.finalize_cutout(cutout, main_only=main_only and not points)
@@ -259,13 +261,12 @@ def compare_slider(before: Image.Image, after: Image.Image, animate: bool, heigh
     components.html(page, height=height + 40)
 
 
-# ---------- Click-to-select (Segment Anything) ----------
+# ---------- Click to select ----------
 def point_picker(data: bytes, digest: str, pts: list) -> None:
     with st.expander("🎯 Not quite right? Pick your product", expanded=bool(pts)):
         st.caption(
             "Click the product to keep it. Switch to Remove and click anything that should go, "
-            "like a hand or another object. Powered by Segment Anything (SAM); "
-            "the first click downloads the model, so give it a moment."
+            "like a hand or another object. The selection follows the edges in your photo."
         )
         mode = st.radio("Click mode", ["➕ Keep", "➖ Remove"], horizontal=True, key="click_mode")
 
@@ -366,8 +367,8 @@ html(
 )
 
 ticker = "   ·   ".join([
-    "AI background removal", "Click to select", "Segment Anything", "Marketplace 2000 × 2000",
-    "Instagram 4:5", "Floor reflections", "Luxury dark", "Transparent PNG", "Batch export",
+    "AI background removal", "Click to select", "Marketplace 2000 × 2000", "Instagram 4:5",
+    "Floor reflections", "Luxury dark", "Transparent PNG", "Batch export", "Edge clean-up",
 ])
 html(f'<div class="marquee"><div class="track"><span>{ticker}</span><span aria-hidden="true">{ticker}</span></div></div>')
 
@@ -391,7 +392,7 @@ with single_tab:
 
         cut_bytes = None
         try:
-            msg = "Selecting your product with Segment Anything…" if active else "Cutting out your product…"
+            msg = "Applying your selection…" if active else "Cutting out your product…"
             with st.spinner(msg + " (the first run downloads the AI model)"):
                 cut_bytes, secs = build_cutout(data, model, main_only, active)
         except ValueError as err:
@@ -481,24 +482,25 @@ with about_tab:
     html(cards([
         ("01", "🧭", "Orientation fix", "Reads the photo's EXIF data so phone photos are never sideways."),
         ("02", "🤖", "AI matting", "U²-Net, IS-Net or BiRefNet (via rembg on ONNX Runtime) finds the foreground and its fine edges."),
-        ("03", "🎯", "Click to select", "Segment Anything (SAM) turns your clicks into a precise object selection."),
-        ("04", "🧩", "Hybrid mask", "SAM decides what the product is; the matting model decides exactly where its edges are."),
+        ("03", "🎯", "Click to select", "Random-walker segmentation turns your clicks into a selection that follows the photo's edges."),
+        ("04", "🧩", "Hybrid mask", "Your selection decides what the product is; the AI mask decides exactly where its edges are."),
         ("05", "📐", "Smart framing", "Stray objects are dropped, then the product is trimmed and scaled for each preset."),
         ("06", "🌗", "Studio compositing", "Backdrop plus a contact shadow, drop shadow or fading floor reflection."),
     ]))
     html('<div class="section-title">Engineering notes.</div>')
     st.markdown(
         "- Every AI step is **cached per photo**, so changing settings re-renders instantly.\n"
+        "- Click-to-select uses a **lightweight graph algorithm instead of a 350 MB model**, "
+        "so it runs comfortably on a free CPU server.\n"
         "- Cut-outs are rebuilt from the **original colours plus the mask**, avoiding dark edge fringes.\n"
         "- Image logic lives in `studio.py`, separate from the UI, so it can be tested and reused.\n"
-        "- Runs entirely on CPU, with no GPU and no paid APIs.\n"
         "- Animations switch off automatically for users who prefer reduced motion."
     )
     html(
         '<div class="section-title">Built with.</div><div>'
         '<span class="chip">Python</span><span class="chip">Streamlit</span>'
-        '<span class="chip">rembg</span><span class="chip">Segment Anything</span>'
-        '<span class="chip">ONNX Runtime</span><span class="chip">SciPy</span>'
+        '<span class="chip">rembg</span><span class="chip">ONNX Runtime</span>'
+        '<span class="chip">scikit-image</span><span class="chip">SciPy</span>'
         '<span class="chip">Pillow</span></div>'
     )
 
