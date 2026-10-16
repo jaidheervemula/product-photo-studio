@@ -70,6 +70,73 @@ def make_backdrop(name: str, size: tuple[int, int], custom_color: str = "#ffffff
     return BACKDROPS[name](size)
 
 
+# ---------------------------------------------------------------------------
+# Masks and cut-outs
+# ---------------------------------------------------------------------------
+
+def prepare_image(image: Image.Image, max_side: int = 2000) -> Image.Image:
+    """Fix phone-photo rotation and limit size. All masks are made at this size."""
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    image.thumbnail((max_side, max_side))
+    return image
+
+
+def _fit_mask(mask: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """Guard against models that return extra stacked masks or a different size."""
+    mask = mask.convert("L")
+    if mask.size != size:
+        if mask.width == size[0] and mask.height > size[1]:
+            mask = mask.crop((0, 0, size[0], size[1]))  # keep the first mask only
+        else:
+            mask = mask.resize(size, Image.BILINEAR)
+    return mask
+
+
+def ai_mask(image: Image.Image, session) -> Image.Image:
+    """Automatic foreground mask from a matting model (U²-Net, IS-Net, BiRefNet)."""
+    from rembg import remove
+
+    return _fit_mask(remove(image, session=session, only_mask=True), image.size)
+
+
+def sam_mask(image: Image.Image, session, points) -> Image.Image:
+    """Mask of the object the user clicked, from Segment Anything.
+
+    `points` are (x, y, label) in image pixels; label 1 = keep, 0 = remove.
+    """
+    from rembg import remove
+
+    prompt = [{"type": "point", "data": [int(x), int(y)], "label": int(label)} for x, y, label in points]
+    return _fit_mask(remove(image, session=session, only_mask=True, sam_prompt=prompt), image.size)
+
+
+def combine_masks(base: Image.Image, selection: Image.Image, grow: int = 6) -> Image.Image:
+    """Hybrid mask: SAM decides WHAT the product is, the matting model decides WHERE its edges are.
+
+    Near the selection's border we keep the matting model's fine edge; deep inside the
+    selection we force full opacity, filling any holes the matting model left.
+    """
+    import numpy as np
+    from scipy import ndimage
+
+    sel = np.array(selection) > 127
+    if not sel.any():
+        return base
+    near = ndimage.binary_dilation(sel, iterations=grow)
+    core = ndimage.binary_erosion(sel, iterations=grow)
+    alpha = np.array(base)
+    alpha = np.where(near, alpha, 0)
+    alpha = np.where(core, 255, alpha).astype(np.uint8)
+    return Image.fromarray(alpha, mode="L")
+
+
+def to_cutout(image: Image.Image, mask: Image.Image) -> Image.Image:
+    """Original colours + mask as alpha (avoids the dark fringes of pre-blended cut-outs)."""
+    out = image.convert("RGBA")
+    out.putalpha(mask)
+    return out
+
+
 def isolate_main_object(cutout: Image.Image, min_alpha: int = 40, keep_ratio: float = 0.5) -> Image.Image:
     """Keep the main product and drop stray objects (a mouse, a cable) and background haze.
 
@@ -88,8 +155,6 @@ def isolate_main_object(cutout: Image.Image, min_alpha: int = 40, keep_ratio: fl
         return cutout
     h, w = solid.shape
 
-    # 1) Break thin bridges. Try a strong erosion first; fall back to gentler ones
-    #    so very thin products (pens, chains) don't disappear completely.
     structure = np.ones((3, 3), dtype=bool)
     radius = max(2, int(max(h, w) * 0.012))
     core = solid
@@ -106,7 +171,6 @@ def isolate_main_object(cutout: Image.Image, min_alpha: int = 40, keep_ratio: fl
     sizes = np.asarray(ndimage.sum(core, labels, ids), dtype=float)
     centres = np.asarray(ndimage.center_of_mass(core, labels, ids), dtype=float).reshape(-1, 2)
 
-    # 2) Big and central wins. dist is 0 at the centre and about 0.7 in a corner.
     dist = np.hypot((centres[:, 1] - w / 2) / w, (centres[:, 0] - h / 2) / h)
     score = sizes * (1.0 - dist)
     best = int(np.argmax(score))
@@ -115,11 +179,10 @@ def isolate_main_object(cutout: Image.Image, min_alpha: int = 40, keep_ratio: fl
         if i != best and sizes[i] >= sizes[best] * keep_ratio and dist[i] < 0.35
     ]
 
-    # 3) Assign every pixel to its nearest blob, then keep only the chosen blobs' pixels.
     _, (iy, ix) = ndimage.distance_transform_edt(labels == 0, return_indices=True)
     nearest = labels[iy, ix]
     keep = solid & np.isin(nearest, keep_ids)
-    keep = ndimage.binary_dilation(keep, structure=structure, iterations=2)  # keep soft edge pixels
+    keep = ndimage.binary_dilation(keep, structure=structure, iterations=2)
 
     alpha = np.where(keep & (alpha >= min_alpha), alpha, 0).astype(np.uint8)
     out = cutout.copy()
@@ -127,13 +190,8 @@ def isolate_main_object(cutout: Image.Image, min_alpha: int = 40, keep_ratio: fl
     return out
 
 
-def remove_background(image: Image.Image, session, max_side: int = 2000, main_only: bool = True) -> Image.Image:
-    """Cut the product out with AI and trim to its bounds. Returns an RGBA image."""
-    from rembg import remove  # imported here so the rest of the module stays lightweight
-
-    image = ImageOps.exif_transpose(image).convert("RGBA")  # fix rotated phone photos
-    image.thumbnail((max_side, max_side))
-    cutout = remove(image, session=session)
+def finalize_cutout(cutout: Image.Image, main_only: bool = True) -> Image.Image:
+    """Optionally isolate the main object, then trim to the product's bounds."""
     if main_only:
         cutout = isolate_main_object(cutout)
     solid = cutout.getchannel("A").point(lambda v: 255 if v > 20 else 0)
@@ -142,6 +200,16 @@ def remove_background(image: Image.Image, session, max_side: int = 2000, main_on
         raise ValueError("Couldn't find a product in this photo. Try one with a clearer subject.")
     return cutout.crop(bbox)
 
+
+def remove_background(image: Image.Image, session, max_side: int = 2000, main_only: bool = True) -> Image.Image:
+    """One-call convenience: prepare, mask, cut out and trim."""
+    image = prepare_image(image, max_side)
+    return finalize_cutout(to_cutout(image, ai_mask(image, session)), main_only)
+
+
+# ---------------------------------------------------------------------------
+# Studio compositing
+# ---------------------------------------------------------------------------
 
 def refine_edges(img: Image.Image) -> Image.Image:
     """Shrink the mask by a pixel and soften it to remove background halos."""
