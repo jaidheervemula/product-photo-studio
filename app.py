@@ -7,8 +7,9 @@ from pathlib import Path
 
 import streamlit as st
 import streamlit.components.v1 as components
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageOps
 from rembg import new_session
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 import studio
 
@@ -21,6 +22,7 @@ MODELS = {
 }
 MAX_BATCH = 10
 IMAGE_TYPES = ["jpg", "jpeg", "png", "webp"]
+PREVIEW_SIDE = 560  # size of the clickable picker image
 
 
 def html(markup: str) -> None:
@@ -42,12 +44,6 @@ def cards(items) -> str:
     return '<div class="steps">' + "".join(parts) + "</div>"
 
 
-@st.cache_resource(show_spinner=False)
-def get_session(model_name: str):
-    """Load each AI model once per server and reuse it."""
-    return new_session(model_name)
-
-
 def encode(img: Image.Image, fmt: str) -> bytes:
     buf = io.BytesIO()
     if fmt == "JPEG":
@@ -57,14 +53,46 @@ def encode(img: Image.Image, fmt: str) -> bytes:
     return buf.getvalue()
 
 
+# ---------- AI steps (each cached, so changing settings never re-runs the AI) ----------
+@st.cache_resource(show_spinner=False)
+def get_session(model_name: str):
+    """Load each AI model once per server and reuse it."""
+    return new_session(model_name)
+
+
+@st.cache_data(show_spinner=False, max_entries=20)
+def working_png(data: bytes) -> bytes:
+    """The upload, rotated correctly and resized. Every mask and click uses this size."""
+    return encode(studio.prepare_image(Image.open(io.BytesIO(data))), "PNG")
+
+
+def load_working(data: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(working_png(data))).convert("RGB")
+
+
 @st.cache_data(show_spinner=False, max_entries=40)
-def cutout_png(data: bytes, model_name: str, main_only: bool) -> tuple[bytes, float]:
-    """Run the slow AI step once per photo; settings changes reuse the cached cut-out."""
+def matte_png(data: bytes, model_name: str) -> tuple[bytes, float]:
     start = time.perf_counter()
-    cut = studio.remove_background(
-        Image.open(io.BytesIO(data)), get_session(model_name), main_only=main_only
-    )
-    return encode(cut, "PNG"), time.perf_counter() - start
+    mask = studio.ai_mask(load_working(data), get_session(model_name))
+    return encode(mask, "PNG"), time.perf_counter() - start
+
+
+@st.cache_data(show_spinner=False, max_entries=40)
+def sam_png(data: bytes, points: tuple) -> bytes:
+    return encode(studio.sam_mask(load_working(data), get_session("sam"), points), "PNG")
+
+
+@st.cache_data(show_spinner=False, max_entries=40)
+def build_cutout(data: bytes, model_name: str, main_only: bool, points: tuple) -> tuple[bytes, float]:
+    """Automatic mask, optionally refined by the user's clicks, then trimmed."""
+    mask_bytes, secs = matte_png(data, model_name)
+    mask = Image.open(io.BytesIO(mask_bytes)).convert("L")
+    if points:
+        selection = Image.open(io.BytesIO(sam_png(data, points))).convert("L")
+        mask = studio.combine_masks(mask, selection)
+    cutout = studio.to_cutout(load_working(data), mask)
+    cutout = studio.finalize_cutout(cutout, main_only=main_only and not points)
+    return encode(cutout, "PNG"), secs
 
 
 def to_data_uri(img: Image.Image, max_side: int = 1000) -> str:
@@ -220,9 +248,7 @@ COMPARE_HTML = """
 
 def compare_slider(before: Image.Image, after: Image.Image, animate: bool, height: int = 520) -> None:
     w, h = after.size
-    before = before.convert("RGB").copy()
-    before.thumbnail((2000, 2000))
-    before = ImageOps.pad(before, (w, h), color=(10, 10, 10))
+    before = ImageOps.pad(before.convert("RGB"), (w, h), color=(10, 10, 10))
     page = (
         COMPARE_HTML.replace("__BEFORE__", to_data_uri(before))
         .replace("__AFTER__", to_data_uri(after))
@@ -231,6 +257,50 @@ def compare_slider(before: Image.Image, after: Image.Image, animate: bool, heigh
         .replace("__ANIMATE__", "true" if animate else "false")
     )
     components.html(page, height=height + 40)
+
+
+# ---------- Click-to-select (Segment Anything) ----------
+def point_picker(data: bytes, digest: str, pts: list) -> None:
+    with st.expander("🎯 Not quite right? Pick your product", expanded=bool(pts)):
+        st.caption(
+            "Click the product to keep it. Switch to Remove and click anything that should go, "
+            "like a hand or another object. Powered by Segment Anything (SAM); "
+            "the first click downloads the model, so give it a moment."
+        )
+        mode = st.radio("Click mode", ["➕ Keep", "➖ Remove"], horizontal=True, key="click_mode")
+
+        working = load_working(data)
+        preview = working.copy()
+        preview.thumbnail((PREVIEW_SIDE, PREVIEW_SIDE))
+        scale = working.width / preview.width
+
+        draw = ImageDraw.Draw(preview)
+        for x, y, label in pts:
+            px, py, r = x / scale, y / scale, 8
+            fill, ring = ((255, 255, 255), (0, 0, 0)) if label == 1 else ((0, 0, 0), (255, 255, 255))
+            draw.ellipse([px - r, py - r, px + r, py + r], fill=fill, outline=ring, width=3)
+
+        nonce = st.session_state.get("click_nonce", 0)
+        click = streamlit_image_coordinates(preview, key=f"click_{digest}_{nonce}")
+        if click is not None:
+            spot = (click["x"], click["y"], nonce)
+            if spot != st.session_state.get("last_click"):
+                st.session_state["last_click"] = spot
+                label = 1 if mode.startswith("➕") else 0
+                pts.append((int(click["x"] * scale), int(click["y"] * scale), label))
+                st.rerun()
+
+        c1, c2 = st.columns(2)
+        if c1.button("Undo last point", disabled=not pts, key="undo_point"):
+            pts.pop()
+            st.session_state["click_nonce"] = nonce + 1
+            st.rerun()
+        if c2.button("Clear all points", disabled=not pts, key="clear_points"):
+            pts.clear()
+            st.session_state["click_nonce"] = nonce + 1
+            st.rerun()
+        if pts and not any(p[2] == 1 for p in pts):
+            st.info("Add at least one ➕ Keep point on the product.")
 
 
 load_css()
@@ -259,7 +329,8 @@ with st.sidebar:
     enhance = st.toggle("Auto-enhance product", value=True, help="Gentle contrast, colour and sharpness boost.")
     clean = st.toggle("Clean cut-out edges", value=True, help="Removes thin background halos around the product.")
     main_only = st.toggle(
-        "Keep main object only", value=True, help="Removes small extra objects and background haze."
+        "Keep main object only", value=True,
+        help="Removes small extra objects and background haze. Ignored when you pick points yourself.",
     )
 
     with st.expander("Advanced"):
@@ -295,8 +366,8 @@ html(
 )
 
 ticker = "   ·   ".join([
-    "AI background removal", "Marketplace 2000 × 2000", "Instagram 4:5", "Floor reflections",
-    "Studio grey", "Luxury dark", "Transparent PNG", "Batch export", "Edge clean-up",
+    "AI background removal", "Click to select", "Segment Anything", "Marketplace 2000 × 2000",
+    "Instagram 4:5", "Floor reflections", "Luxury dark", "Transparent PNG", "Batch export",
 ])
 html(f'<div class="marquee"><div class="track"><span>{ticker}</span><span aria-hidden="true">{ticker}</span></div></div>')
 
@@ -307,20 +378,26 @@ with single_tab:
     up = st.file_uploader("Upload a product photo", type=IMAGE_TYPES, key="single")
     if up is None:
         html(cards([
-            ("01", "⬆️", "Upload", "Any phone photo of a single product. Best on a plain surface."),
+            ("01", "⬆️", "Upload", "Any phone photo of a product. Best on a plain surface."),
             ("02", "🤖", "AI cut-out", "The background and stray objects are removed automatically."),
-            ("03", "🎨", "Style", "Pick a backdrop, shadow and export preset. The preview updates live."),
+            ("03", "🎯", "Fine-tune", "Click the product, or anything to remove, if the AI needs a hint."),
             ("04", "⬇️", "Export", "Download a marketplace-ready image, or a whole batch as a ZIP."),
         ]))
     else:
         data = up.getvalue()
         digest = hashlib.md5(data).hexdigest()
+        pts = st.session_state.setdefault("points", {}).setdefault(digest, [])
+        active = tuple(pts) if any(p[2] == 1 for p in pts) else ()
+
+        cut_bytes = None
         try:
-            with st.spinner("Cutting out your product… (the first run downloads the AI model)"):
-                cut_bytes, secs = cutout_png(data, model, main_only)
+            msg = "Selecting your product with Segment Anything…" if active else "Cutting out your product…"
+            with st.spinner(msg + " (the first run downloads the AI model)"):
+                cut_bytes, secs = build_cutout(data, model, main_only, active)
         except ValueError as err:
             st.error(str(err))
-        else:
+
+        if cut_bytes:
             cut = Image.open(io.BytesIO(cut_bytes))
             result = studio.compose(cut, **settings)
 
@@ -333,13 +410,12 @@ with single_tab:
             if view.startswith("🎬"):
                 showcase(result)
             else:
-                original = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
-                compare_slider(original, result, animate)
+                compare_slider(load_working(data), result, animate)
 
             m1, m2, m3 = st.columns(3)
             m1.metric("AI cut-out time", f"{secs:.1f} s")
             m2.metric("Output size", f"{result.width} × {result.height}")
-            m3.metric("Format", out_fmt)
+            m3.metric("Selection", f"{len(pts)} point(s)" if active else "Automatic")
 
             d1, d2 = st.columns(2)
             d1.download_button(
@@ -349,6 +425,8 @@ with single_tab:
             d2.download_button(
                 "Transparent cut-out (PNG)", cut_bytes, file_name="cutout.png", mime="image/png",
             )
+
+        point_picker(data, digest, pts)
 
 # ---------- Batch mode ----------
 with batch_tab:
@@ -372,7 +450,7 @@ with batch_tab:
                 for i, f in enumerate(files, 1):
                     progress.progress((i - 1) / len(files), text=f"Processing {f.name} ({i}/{len(files)})…")
                     try:
-                        cut_bytes, _ = cutout_png(f.getvalue(), model, main_only)
+                        cut_bytes, _ = build_cutout(f.getvalue(), model, main_only, ())
                         img = studio.compose(Image.open(io.BytesIO(cut_bytes)), **settings)
                         stem = f.name.rsplit(".", 1)[0]
                         zf.writestr(f"{i:02d}-{stem}-studio.{ext}", encode(img, out_fmt))
@@ -402,15 +480,16 @@ with about_tab:
     html('<div class="section-title">From phone photo to studio shot.</div>')
     html(cards([
         ("01", "🧭", "Orientation fix", "Reads the photo's EXIF data so phone photos are never sideways."),
-        ("02", "🤖", "AI segmentation", "U²-Net, IS-Net or BiRefNet (via rembg on ONNX Runtime) separates the product from the background."),
-        ("03", "🎯", "Main-object isolation", "Connected-component analysis keeps the product and drops stray objects and haze."),
-        ("04", "✂️", "Edge clean-up", "The mask is tightened and softened to remove halos."),
-        ("05", "📐", "Smart framing", "The product is trimmed to its bounds and scaled for each export preset."),
+        ("02", "🤖", "AI matting", "U²-Net, IS-Net or BiRefNet (via rembg on ONNX Runtime) finds the foreground and its fine edges."),
+        ("03", "🎯", "Click to select", "Segment Anything (SAM) turns your clicks into a precise object selection."),
+        ("04", "🧩", "Hybrid mask", "SAM decides what the product is; the matting model decides exactly where its edges are."),
+        ("05", "📐", "Smart framing", "Stray objects are dropped, then the product is trimmed and scaled for each preset."),
         ("06", "🌗", "Studio compositing", "Backdrop plus a contact shadow, drop shadow or fading floor reflection."),
     ]))
     html('<div class="section-title">Engineering notes.</div>')
     st.markdown(
-        "- The slow AI step is **cached per photo**, so changing settings re-renders instantly.\n"
+        "- Every AI step is **cached per photo**, so changing settings re-renders instantly.\n"
+        "- Cut-outs are rebuilt from the **original colours plus the mask**, avoiding dark edge fringes.\n"
         "- Image logic lives in `studio.py`, separate from the UI, so it can be tested and reused.\n"
         "- Runs entirely on CPU, with no GPU and no paid APIs.\n"
         "- Animations switch off automatically for users who prefer reduced motion."
@@ -418,8 +497,9 @@ with about_tab:
     html(
         '<div class="section-title">Built with.</div><div>'
         '<span class="chip">Python</span><span class="chip">Streamlit</span>'
-        '<span class="chip">rembg</span><span class="chip">ONNX Runtime</span>'
-        '<span class="chip">SciPy</span><span class="chip">Pillow</span></div>'
+        '<span class="chip">rembg</span><span class="chip">Segment Anything</span>'
+        '<span class="chip">ONNX Runtime</span><span class="chip">SciPy</span>'
+        '<span class="chip">Pillow</span></div>'
     )
 
 html(
