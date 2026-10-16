@@ -65,31 +65,122 @@ def to_data_uri(img: Image.Image, max_side: int = 1000) -> str:
     img = img.convert("RGB").copy()
     img.thumbnail((max_side, max_side))
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
+    img.save(buf, format="JPEG", quality=88)
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+# ---------- Cinematic showcase: a virtual camera moving around the result ----------
+SHOWCASE_HTML = """
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: transparent; font-family: Inter, -apple-system, system-ui, sans-serif; }
+  .scene { position: relative; height: __H__px; border-radius: 28px; overflow: hidden; perspective: 1600px;
+           display: flex; align-items: center; justify-content: center; cursor: grab;
+           background: radial-gradient(60% 55% at 50% 40%, #1d1d1f 0%, #050505 65%, #000 100%);
+           border: 1px solid rgba(255,255,255,.08); animation: sceneIn 1s cubic-bezier(.22,1,.36,1) both; }
+  .scene::before { content: ""; position: absolute; width: 140%; height: 60%; top: -22%; left: -20%;
+           background: radial-gradient(closest-side, rgba(255,255,255,.10), transparent);
+           animation: spot 16s ease-in-out infinite; pointer-events: none; }
+  .rig { margin-top: -70px; transform-style: preserve-3d; animation: camera 16s cubic-bezier(.45,0,.2,1) infinite; }
+  .tilt { transform-style: preserve-3d; transition: transform .6s cubic-bezier(.22,1,.36,1); }
+  .card { position: relative; width: __CW__px; aspect-ratio: __RATIO__; border-radius: 18px; overflow: hidden;
+          box-shadow: 0 60px 120px rgba(0,0,0,.95), 0 0 0 1px rgba(255,255,255,.10);
+          -webkit-box-reflect: below 16px linear-gradient(transparent 70%, rgba(255,255,255,.16)); }
+  .card img { display: block; width: 100%; height: 100%; object-fit: cover; }
+  .glare { position: absolute; inset: 0; pointer-events: none;
+           background: linear-gradient(115deg, transparent 35%, rgba(255,255,255,.35) 50%, transparent 65%);
+           transform: translateX(-130%); animation: glare 16s ease-in-out infinite; }
+  .cap { position: absolute; left: 0; right: 0; bottom: 28px; text-align: center; color: #f5f5f7;
+         font-size: 22px; font-weight: 700; letter-spacing: -.02em; opacity: 0; pointer-events: none;
+         animation: cap 16s ease-in-out infinite; }
+  .c2 { animation-delay: 5.33s; } .c3 { animation-delay: 10.67s; }
+  .hint { position: absolute; top: 18px; left: 22px; font-size: 11px; font-weight: 600; letter-spacing: .18em;
+          text-transform: uppercase; color: #86868b; }
+  .live { position: absolute; top: 16px; right: 20px; display: flex; align-items: center; gap: 8px;
+          font-size: 11px; font-weight: 700; letter-spacing: .18em; color: #f5f5f7; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #fff; animation: pulse 1.6s ease-in-out infinite; }
+  @keyframes sceneIn { from { opacity: 0; transform: scale(.97); filter: blur(10px); } to { opacity: 1; transform: none; filter: none; } }
+  @keyframes camera {
+    0%   { transform: translateZ(-140px) rotateY(-34deg) rotateX(10deg) rotateZ(-2deg); }
+    18%  { transform: translateZ(20px)   rotateY(-10deg) rotateX(4deg)  rotateZ(0deg); }
+    36%  { transform: translateZ(60px)   rotateY(26deg)  rotateX(-5deg) rotateZ(2deg); }
+    56%  { transform: translateZ(150px)  rotateY(0deg)   rotateX(0deg)  rotateZ(0deg); }
+    76%  { transform: translateZ(10px)   rotateY(38deg)  rotateX(12deg) rotateZ(-3deg); }
+    100% { transform: translateZ(-140px) rotateY(-34deg) rotateX(10deg) rotateZ(-2deg); }
+  }
+  @keyframes glare { 0%, 40% { transform: translateX(-130%); } 56%, 100% { transform: translateX(130%); } }
+  @keyframes spot { 0%, 100% { transform: translateX(-10%); } 50% { transform: translateX(25%); } }
+  @keyframes cap {
+    0% { opacity: 0; transform: translateY(14px); filter: blur(8px); }
+    5%, 27% { opacity: 1; transform: none; filter: none; }
+    33%, 100% { opacity: 0; transform: translateY(-10px); filter: blur(8px); }
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+  @media (prefers-reduced-motion: reduce) {
+    .rig, .glare, .cap, .scene, .scene::before, .dot { animation: none !important; }
+    .c1 { opacity: 1; }
+  }
+</style>
+<div class="scene" id="scene">
+  <div class="hint">Move your cursor to look around</div>
+  <div class="live"><span class="dot"></span>LIVE PREVIEW</div>
+  <div class="rig" id="rig"><div class="tilt" id="tilt"><div class="card">
+    <img src="__IMG__" alt="Studio shot"><div class="glare"></div>
+  </div></div></div>
+  <div class="cap c1">Studio lighting.</div>
+  <div class="cap c2">Every angle.</div>
+  <div class="cap c3">Ready to sell.</div>
+</div>
+<script>
+  const scene = document.getElementById("scene"), rig = document.getElementById("rig"), tilt = document.getElementById("tilt");
+  scene.addEventListener("pointermove", e => {
+    const r = scene.getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width - 0.5, y = (e.clientY - r.top) / r.height - 0.5;
+    rig.style.animationPlayState = "paused";
+    tilt.style.transform = `rotateY(${x * 40}deg) rotateX(${-y * 24}deg) translateZ(40px)`;
+  });
+  scene.addEventListener("pointerleave", () => {
+    tilt.style.transform = "";
+    rig.style.animationPlayState = "running";
+  });
+</script>
+"""
+
+
+def showcase(img: Image.Image, height: int = 560) -> None:
+    w, h = img.size
+    card_w = min(int(300 * w / h), 520)
+    page = (
+        SHOWCASE_HTML.replace("__IMG__", to_data_uri(img, 1200))
+        .replace("__H__", str(height))
+        .replace("__CW__", str(card_w))
+        .replace("__RATIO__", f"{w} / {h}")
+    )
+    components.html(page, height=height + 10)
+
+
+# ---------- Before / after slider ----------
 COMPARE_HTML = """
 <style>
-  body { margin: 0; padding: 12px 0 20px; background: transparent; font-family: system-ui, sans-serif; }
+  body { margin: 0; padding: 12px 0 20px; background: transparent; font-family: -apple-system, system-ui, sans-serif; }
   .wrap { position: relative; width: min(100%, __MAXW__px); aspect-ratio: __RATIO__; margin: 0 auto;
-          border-radius: 20px; overflow: hidden; border: 1px solid rgba(124,92,255,.35);
-          box-shadow: 0 18px 50px rgba(124,92,255,.30); animation: rise .8s cubic-bezier(.22,1,.36,1) both; }
+          border-radius: 22px; overflow: hidden; border: 1px solid rgba(255,255,255,.12);
+          box-shadow: 0 30px 80px rgba(0,0,0,.8); animation: rise .9s cubic-bezier(.22,1,.36,1) both; }
   .wrap img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
               user-select: none; pointer-events: none; }
   #after { clip-path: inset(0 0 0 100%); }
-  .line { position: absolute; top: 0; bottom: 0; left: 100%; width: 3px; transform: translateX(-50%);
-          background: linear-gradient(#ff4d8d, #7c5cff, #22d3ee); box-shadow: 0 0 18px #ff4d8d; pointer-events: none; }
-  .knob { position: absolute; top: 50%; left: 100%; width: 48px; height: 48px; border-radius: 50%;
+  .line { position: absolute; top: 0; bottom: 0; left: 100%; width: 2px; transform: translateX(-50%);
+          background: #fff; box-shadow: 0 0 20px rgba(255,255,255,.8); pointer-events: none; }
+  .knob { position: absolute; top: 50%; left: 100%; width: 46px; height: 46px; border-radius: 50%;
           transform: translate(-50%, -50%); display: flex; align-items: center; justify-content: center;
-          color: #fff; font-size: 20px; font-weight: 800; pointer-events: none;
-          background: linear-gradient(135deg, #ff4d8d, #7c5cff);
-          box-shadow: 0 0 0 5px rgba(255,255,255,.18), 0 10px 30px rgba(0,0,0,.45); }
-  .tag { position: absolute; top: 14px; padding: 5px 12px; border-radius: 999px; font-size: 11px; font-weight: 800;
-         letter-spacing: .12em; color: #fff; background: rgba(11,10,26,.6); backdrop-filter: blur(6px); pointer-events: none; }
+          background: #fff; color: #000; font-size: 18px; font-weight: 800; pointer-events: none;
+          box-shadow: 0 0 0 6px rgba(255,255,255,.15), 0 10px 30px rgba(0,0,0,.6); }
+  .tag { position: absolute; top: 14px; padding: 6px 12px; border-radius: 999px; font-size: 11px; font-weight: 700;
+         letter-spacing: .14em; color: #fff; background: rgba(0,0,0,.55); backdrop-filter: blur(8px); pointer-events: none; }
   .tag.l { left: 14px; } .tag.r { right: 14px; }
   input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: ew-resize; }
-  @keyframes rise { from { opacity: 0; transform: translateY(20px) scale(.98); } to { opacity: 1; transform: none; } }
+  @keyframes rise { from { opacity: 0; transform: translateY(24px) scale(.97); filter: blur(10px); } to { opacity: 1; transform: none; filter: none; } }
   @media (prefers-reduced-motion: reduce) { .wrap { animation: none; } }
 </style>
 <div class="wrap">
@@ -115,18 +206,17 @@ COMPARE_HTML = """
       s.value = v; set(v);
       if (p < 1) requestAnimationFrame(sweep);
     };
-    setTimeout(() => requestAnimationFrame(sweep), 350);
+    setTimeout(() => requestAnimationFrame(sweep), 400);
   } else { s.value = 50; set(50); }
 </script>
 """
 
 
 def compare_slider(before: Image.Image, after: Image.Image, animate: bool, height: int = 520) -> None:
-    """Interactive before/after slider that sweeps open when a new photo arrives."""
     w, h = after.size
     before = before.convert("RGB").copy()
     before.thumbnail((2000, 2000))
-    before = ImageOps.pad(before, (w, h), color=(22, 20, 43))
+    before = ImageOps.pad(before, (w, h), color=(10, 10, 10))
     page = (
         COMPARE_HTML.replace("__BEFORE__", to_data_uri(before))
         .replace("__AFTER__", to_data_uri(after))
@@ -141,7 +231,7 @@ load_css()
 
 # ---------- Sidebar: settings ----------
 with st.sidebar:
-    html('<div class="side-title">🎛️ Studio settings</div>')
+    html('<div class="side-title">Studio settings</div>')
     preset_name = st.selectbox("Export for", list(studio.PRESETS))
     preset = studio.PRESETS[preset_name]
     st.caption(preset.note)
@@ -178,20 +268,30 @@ settings = dict(
 # ---------- Hero ----------
 html(
     '<div class="hero">'
-    '<div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div>'
-    '<div class="hero-content">'
-    '<div class="eyebrow">AI · E-COMMERCE · STUDIO</div>'
-    '<div class="hero-title"><span class="cam">📸</span> Product Photo <span class="grad">Studio</span></div>'
-    '<p class="hero-sub">Turn casual phone photos into clean, marketplace-ready product shots in seconds.</p>'
-    '<div class="pills">'
-    '<span class="pill">🤖 AI background removal</span>'
-    '<span class="pill">🛒 Marketplace &amp; social presets</span>'
-    '<span class="pill">🌗 Studio shadows &amp; reflections</span>'
-    '<span class="pill">📦 Batch export</span>'
-    "</div></div></div>"
+    '<div class="hero-text">'
+    '<div class="eyebrow">Product Photo Studio</div>'
+    '<div class="headline"><span class="w">Your</span> <span class="w">product.</span><br>'
+    '<span class="w">Every</span> <span class="w">angle.</span></div>'
+    '<p class="sub">Turn a casual phone photo into a studio-grade, marketplace-ready shot in seconds. '
+    'Powered by AI, running entirely in your browser session.</p>'
+    '<div class="stats"><div><b>6</b><span>Backdrops</span></div>'
+    '<div><b>5</b><span>Export presets</span></div>'
+    '<div><b>10</b><span>Photos per batch</span></div></div>'
+    "</div>"
+    '<div class="stage"><div class="device-wrap"><div class="device"><div class="screen">'
+    '<div class="island"></div><div class="orb"></div><div class="orb-shadow"></div>'
+    '<div class="screen-label">STUDIO</div><div class="glare"></div>'
+    "</div></div></div></div>"
+    "</div>"
 )
 
-single_tab, batch_tab, about_tab = st.tabs(["✨ Single photo", "📦 Batch mode", "🧠 How it works"])
+ticker = "   ·   ".join([
+    "AI background removal", "Marketplace 2000 × 2000", "Instagram 4:5", "Floor reflections",
+    "Studio grey", "Luxury dark", "Transparent PNG", "Batch export", "Edge clean-up",
+])
+html(f'<div class="marquee"><div class="track"><span>{ticker}</span><span aria-hidden="true">{ticker}</span></div></div>')
+
+single_tab, batch_tab, about_tab = st.tabs(["Single photo", "Batch mode", "How it works"])
 
 # ---------- Single photo ----------
 with single_tab:
@@ -207,7 +307,7 @@ with single_tab:
         data = up.getvalue()
         digest = hashlib.md5(data).hexdigest()
         try:
-            with st.spinner("Cutting out your product with AI… (the first run downloads the model)"):
+            with st.spinner("Cutting out your product… (the first run downloads the AI model)"):
                 cut_bytes, secs = cutout_png(data, model)
         except ValueError as err:
             st.error(str(err))
@@ -217,8 +317,15 @@ with single_tab:
 
             animate = st.session_state.get("last_photo") != digest
             st.session_state["last_photo"] = digest
-            original = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
-            compare_slider(original, result, animate)
+
+            view = st.radio(
+                "View", ["🎬 Showcase", "↔ Before / After"], horizontal=True, label_visibility="collapsed"
+            )
+            if view.startswith("🎬"):
+                showcase(result)
+            else:
+                original = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+                compare_slider(original, result, animate)
 
             m1, m2, m3 = st.columns(3)
             m1.metric("AI cut-out time", f"{secs:.1f} s")
@@ -227,16 +334,16 @@ with single_tab:
 
             d1, d2 = st.columns(2)
             d1.download_button(
-                "⬇️ Download studio shot", encode(result, out_fmt),
-                file_name=f"studio-shot.{ext}", mime=mime, type="primary", use_container_width=True,
+                "Download studio shot", encode(result, out_fmt),
+                file_name=f"studio-shot.{ext}", mime=mime, type="primary",
             )
             d2.download_button(
-                "⬇️ Transparent cut-out (PNG)", cut_bytes,
-                file_name="cutout.png", mime="image/png", use_container_width=True,
+                "Transparent cut-out (PNG)", cut_bytes, file_name="cutout.png", mime="image/png",
             )
 
 # ---------- Batch mode ----------
 with batch_tab:
+    html('<div class="section-title">Your whole catalogue. One click.</div>')
     st.write(
         f"Process up to **{MAX_BATCH} photos** at once with the current settings "
         "and download them all as a ZIP."
@@ -249,7 +356,7 @@ with batch_tab:
             st.warning(f"Only the first {MAX_BATCH} photos will be processed.")
             files = files[:MAX_BATCH]
 
-        if st.button(f"🚀 Process {len(files)} photo(s)", type="primary"):
+        if st.button(f"Process {len(files)} photo(s)", type="primary"):
             progress = st.progress(0.0, text="Starting…")
             zip_buf, previews, failed = io.BytesIO(), [], []
             with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -265,7 +372,7 @@ with batch_tab:
                         previews.append((f.name, thumb))
                     except Exception as err:  # keep going if one photo fails
                         failed.append(f"{f.name}: {err}")
-            progress.progress(1.0, text="Done ✅")
+            progress.progress(1.0, text="Done")
             st.session_state["batch"] = {"zip": zip_buf.getvalue(), "previews": previews, "failed": failed}
 
         batch = st.session_state.get("batch")
@@ -277,13 +384,13 @@ with batch_tab:
                 with cols[idx % 5]:
                     st.image(thumb, caption=name)
             st.download_button(
-                "⬇️ Download all (ZIP)", batch["zip"],
+                "Download all (ZIP)", batch["zip"],
                 file_name="studio-shots.zip", mime="application/zip", type="primary",
             )
 
 # ---------- How it works ----------
 with about_tab:
-    html('<div class="section-title">The pipeline</div>')
+    html('<div class="section-title">From phone photo to studio shot.</div>')
     html(cards([
         ("01", "🧭", "Orientation fix", "Reads the photo's EXIF data so phone photos are never sideways."),
         ("02", "🤖", "AI segmentation", "A U²-Net or IS-Net model (via rembg on ONNX Runtime) separates the product from the background."),
@@ -292,7 +399,7 @@ with about_tab:
         ("05", "🌗", "Studio compositing", "Backdrop plus a contact shadow, drop shadow or fading floor reflection."),
         ("06", "📦", "Export", "PNG or high-quality JPEG, one at a time or as a ZIP."),
     ]))
-    html('<div class="section-title">Engineering notes</div>')
+    html('<div class="section-title">Engineering notes.</div>')
     st.markdown(
         "- The slow AI step is **cached per photo**, so changing settings re-renders instantly.\n"
         "- Image logic lives in `studio.py`, separate from the UI, so it can be tested and reused.\n"
@@ -300,10 +407,10 @@ with about_tab:
         "- Animations switch off automatically for users who prefer reduced motion."
     )
     html(
-        '<div class="section-title">Built with</div><div>'
-        '<span class="chip">🐍 Python</span><span class="chip">🎈 Streamlit</span>'
-        '<span class="chip">✂️ rembg</span><span class="chip">⚙️ ONNX Runtime</span>'
-        '<span class="chip">🖼️ Pillow</span></div>'
+        '<div class="section-title">Built with.</div><div>'
+        '<span class="chip">Python</span><span class="chip">Streamlit</span>'
+        '<span class="chip">rembg</span><span class="chip">ONNX Runtime</span>'
+        '<span class="chip">Pillow</span></div>'
     )
 
 html(
