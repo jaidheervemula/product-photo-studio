@@ -14,7 +14,11 @@ import studio
 
 st.set_page_config(page_title="Product Photo Studio", page_icon="📸", layout="wide")
 
-MODELS = {"Balanced (U²-Net)": "u2net", "Sharp edges (IS-Net)": "isnet-general-use"}
+MODELS = {
+    "Balanced (U²-Net)": "u2net",
+    "Sharp edges (IS-Net)": "isnet-general-use",
+    "Best quality (BiRefNet lite, slower)": "birefnet-general-lite",
+}
 MAX_BATCH = 10
 IMAGE_TYPES = ["jpg", "jpeg", "png", "webp"]
 
@@ -54,10 +58,12 @@ def encode(img: Image.Image, fmt: str) -> bytes:
 
 
 @st.cache_data(show_spinner=False, max_entries=40)
-def cutout_png(data: bytes, model_name: str) -> tuple[bytes, float]:
+def cutout_png(data: bytes, model_name: str, main_only: bool) -> tuple[bytes, float]:
     """Run the slow AI step once per photo; settings changes reuse the cached cut-out."""
     start = time.perf_counter()
-    cut = studio.remove_background(Image.open(io.BytesIO(data)), get_session(model_name))
+    cut = studio.remove_background(
+        Image.open(io.BytesIO(data)), get_session(model_name), main_only=main_only
+    )
     return encode(cut, "PNG"), time.perf_counter() - start
 
 
@@ -252,6 +258,9 @@ with st.sidebar:
     shadow = st.selectbox("Shadow", studio.SHADOWS, index=1)
     enhance = st.toggle("Auto-enhance product", value=True, help="Gentle contrast, colour and sharpness boost.")
     clean = st.toggle("Clean cut-out edges", value=True, help="Removes thin background halos around the product.")
+    main_only = st.toggle(
+        "Keep main object only", value=True, help="Removes small extra objects and background haze."
+    )
 
     with st.expander("Advanced"):
         model_label = st.selectbox("AI model", list(MODELS))
@@ -273,7 +282,7 @@ html(
     '<div class="headline"><span class="w">Your</span> <span class="w">product.</span><br>'
     '<span class="w">Every</span> <span class="w">angle.</span></div>'
     '<p class="sub">Turn a casual phone photo into a studio-grade, marketplace-ready shot in seconds. '
-    'Powered by AI, running entirely in your browser session.</p>'
+    'Powered by open-source AI, running on CPU.</p>'
     '<div class="stats"><div><b>6</b><span>Backdrops</span></div>'
     '<div><b>5</b><span>Export presets</span></div>'
     '<div><b>10</b><span>Photos per batch</span></div></div>'
@@ -298,8 +307,8 @@ with single_tab:
     up = st.file_uploader("Upload a product photo", type=IMAGE_TYPES, key="single")
     if up is None:
         html(cards([
-            ("01", "⬆️", "Upload", "Any phone photo of a single product."),
-            ("02", "🤖", "AI cut-out", "The background is removed and edges are cleaned automatically."),
+            ("01", "⬆️", "Upload", "Any phone photo of a single product. Best on a plain surface."),
+            ("02", "🤖", "AI cut-out", "The background and stray objects are removed automatically."),
             ("03", "🎨", "Style", "Pick a backdrop, shadow and export preset. The preview updates live."),
             ("04", "⬇️", "Export", "Download a marketplace-ready image, or a whole batch as a ZIP."),
         ]))
@@ -308,7 +317,7 @@ with single_tab:
         digest = hashlib.md5(data).hexdigest()
         try:
             with st.spinner("Cutting out your product… (the first run downloads the AI model)"):
-                cut_bytes, secs = cutout_png(data, model)
+                cut_bytes, secs = cutout_png(data, model, main_only)
         except ValueError as err:
             st.error(str(err))
         else:
@@ -363,7 +372,7 @@ with batch_tab:
                 for i, f in enumerate(files, 1):
                     progress.progress((i - 1) / len(files), text=f"Processing {f.name} ({i}/{len(files)})…")
                     try:
-                        cut_bytes, _ = cutout_png(f.getvalue(), model)
+                        cut_bytes, _ = cutout_png(f.getvalue(), model, main_only)
                         img = studio.compose(Image.open(io.BytesIO(cut_bytes)), **settings)
                         stem = f.name.rsplit(".", 1)[0]
                         zf.writestr(f"{i:02d}-{stem}-studio.{ext}", encode(img, out_fmt))
@@ -393,11 +402,11 @@ with about_tab:
     html('<div class="section-title">From phone photo to studio shot.</div>')
     html(cards([
         ("01", "🧭", "Orientation fix", "Reads the photo's EXIF data so phone photos are never sideways."),
-        ("02", "🤖", "AI segmentation", "A U²-Net or IS-Net model (via rembg on ONNX Runtime) separates the product from the background."),
-        ("03", "✂️", "Edge clean-up", "The mask is tightened and softened to remove halos."),
-        ("04", "📐", "Smart framing", "The product is trimmed to its bounds and scaled for each export preset."),
-        ("05", "🌗", "Studio compositing", "Backdrop plus a contact shadow, drop shadow or fading floor reflection."),
-        ("06", "📦", "Export", "PNG or high-quality JPEG, one at a time or as a ZIP."),
+        ("02", "🤖", "AI segmentation", "U²-Net, IS-Net or BiRefNet (via rembg on ONNX Runtime) separates the product from the background."),
+        ("03", "🎯", "Main-object isolation", "Connected-component analysis keeps the product and drops stray objects and haze."),
+        ("04", "✂️", "Edge clean-up", "The mask is tightened and softened to remove halos."),
+        ("05", "📐", "Smart framing", "The product is trimmed to its bounds and scaled for each export preset."),
+        ("06", "🌗", "Studio compositing", "Backdrop plus a contact shadow, drop shadow or fading floor reflection."),
     ]))
     html('<div class="section-title">Engineering notes.</div>')
     st.markdown(
@@ -410,7 +419,7 @@ with about_tab:
         '<div class="section-title">Built with.</div><div>'
         '<span class="chip">Python</span><span class="chip">Streamlit</span>'
         '<span class="chip">rembg</span><span class="chip">ONNX Runtime</span>'
-        '<span class="chip">Pillow</span></div>'
+        '<span class="chip">SciPy</span><span class="chip">Pillow</span></div>'
     )
 
 html(
