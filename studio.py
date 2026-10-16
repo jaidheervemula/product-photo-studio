@@ -193,14 +193,21 @@ def to_cutout(image: Image.Image, mask: Image.Image) -> Image.Image:
     return out
 
 
-def isolate_main_object(cutout: Image.Image, min_alpha: int = 40, keep_ratio: float = 0.5) -> Image.Image:
-    """Keep the main product and drop stray objects (a mouse, a cable) and background haze.
+def isolate_main_object(
+    cutout: Image.Image,
+    min_alpha: int = 40,
+    keep_ratio: float = 0.5,
+    bump_ratio: float = 0.02,
+) -> Image.Image:
+    """Keep the main product and drop stray objects, background haze and small bumps.
 
     1. Erode the mask so objects joined by thin bridges (cables, shadows, haze) separate.
     2. Score each blob by size and closeness to the photo's centre; keep the winner,
        plus any similar-sized blob near the centre (so pairs like earrings survive).
     3. Give every original mask pixel to its nearest blob and keep the chosen blobs' pixels,
-       which restores the product's exact outline, including thin parts like straps.
+       which restores the product's exact outline.
+    4. Trim small bumps stuck to the outline (e.g. a dark object under a corner). Bumps
+       smaller than `bump_ratio` of the product are removed; larger parts like straps stay.
     """
     import numpy as np
     from scipy import ndimage
@@ -210,8 +217,9 @@ def isolate_main_object(cutout: Image.Image, min_alpha: int = 40, keep_ratio: fl
     if not solid.any():
         return cutout
     h, w = solid.shape
-
     structure = np.ones((3, 3), dtype=bool)
+
+    # 1) Break thin bridges.
     radius = max(2, int(max(h, w) * 0.012))
     core = solid
     for r in (radius, radius // 2, 1):
@@ -220,13 +228,13 @@ def isolate_main_object(cutout: Image.Image, min_alpha: int = 40, keep_ratio: fl
             core = eroded
             break
 
+    # 2) Pick the main blob(s): big and central wins.
     labels, count = ndimage.label(core)
     if count == 0:
         return cutout
     ids = np.arange(1, count + 1)
     sizes = np.asarray(ndimage.sum(core, labels, ids), dtype=float)
     centres = np.asarray(ndimage.center_of_mass(core, labels, ids), dtype=float).reshape(-1, 2)
-
     dist = np.hypot((centres[:, 1] - w / 2) / w, (centres[:, 0] - h / 2) / h)
     score = sizes * (1.0 - dist)
     best = int(np.argmax(score))
@@ -235,11 +243,23 @@ def isolate_main_object(cutout: Image.Image, min_alpha: int = 40, keep_ratio: fl
         if i != best and sizes[i] >= sizes[best] * keep_ratio and dist[i] < 0.35
     ]
 
+    # 3) Restore the exact outline by giving each pixel to its nearest blob.
     _, (iy, ix) = ndimage.distance_transform_edt(labels == 0, return_indices=True)
     nearest = labels[iy, ix]
-    keep = solid & np.isin(nearest, keep_ids)
-    keep = ndimage.binary_dilation(keep, structure=structure, iterations=2)
+    kept = solid & np.isin(nearest, keep_ids)
 
+    # 4) Trim small bumps on the outline.
+    bump_r = max(2, int(max(h, w) * 0.015))
+    opened = ndimage.binary_opening(kept, structure=structure, iterations=bump_r)
+    if opened.any():
+        bumps = kept & ~ndimage.binary_dilation(opened, structure=structure, iterations=2)
+        bump_labels, n_bumps = ndimage.label(bumps)
+        if n_bumps:
+            bump_sizes = np.asarray(ndimage.sum(bumps, bump_labels, np.arange(1, n_bumps + 1)))
+            small_ids = np.flatnonzero(bump_sizes < kept.sum() * bump_ratio) + 1
+            kept &= ~np.isin(bump_labels, small_ids)
+
+    keep = ndimage.binary_dilation(kept, structure=structure, iterations=2)  # keep soft edge pixels
     alpha = np.where(keep & (alpha >= min_alpha), alpha, 0).astype(np.uint8)
     out = cutout.copy()
     out.putalpha(Image.fromarray(alpha))
