@@ -1,8 +1,12 @@
+import base64
+import hashlib
 import io
 import time
 import zipfile
+from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 from rembg import new_session
 
@@ -10,26 +14,28 @@ import studio
 
 st.set_page_config(page_title="Product Photo Studio", page_icon="📸", layout="wide")
 
-st.markdown(
-    """
-<style>
-.hero {padding: 1.8rem 2rem; border-radius: 18px; margin-bottom: 1.4rem;
-       background: linear-gradient(135deg, #0f172a 0%, #1e293b 55%, #6d28d9 140%);}
-.hero-title {color: #fff; font-size: 2.3rem; font-weight: 800; margin: 0 0 .35rem 0;}
-.hero-sub {color: #cbd5e1; font-size: 1.05rem; margin: 0;}
-.pill {display: inline-block; padding: .25rem .75rem; margin: .9rem .4rem 0 0;
-       border-radius: 999px; background: rgba(255,255,255,.12); color: #e2e8f0; font-size: .8rem;}
-.frame-label {font-size: .78rem; font-weight: 700; letter-spacing: .1em;
-              text-transform: uppercase; color: #64748b; margin-bottom: .4rem;}
-.footer {text-align: center; color: #94a3b8; font-size: .85rem; margin-top: 2.5rem;}
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
 MODELS = {"Balanced (U²-Net)": "u2net", "Sharp edges (IS-Net)": "isnet-general-use"}
 MAX_BATCH = 10
 IMAGE_TYPES = ["jpg", "jpeg", "png", "webp"]
+
+
+def html(markup: str) -> None:
+    st.markdown(markup, unsafe_allow_html=True)
+
+
+def load_css() -> None:
+    css = (Path(__file__).parent / "style.css").read_text(encoding="utf-8")
+    css = "\n".join(line for line in css.splitlines() if line.strip())
+    html(f"<style>{css}</style>")
+
+
+def cards(items) -> str:
+    parts = [
+        f'<div class="step"><div class="num">{num}</div><div class="ico">{icon}</div>'
+        f'<div class="t">{title}</div><div class="d">{desc}</div></div>'
+        for num, icon, title, desc in items
+    ]
+    return '<div class="steps">' + "".join(parts) + "</div>"
 
 
 @st.cache_resource(show_spinner=False)
@@ -55,9 +61,87 @@ def cutout_png(data: bytes, model_name: str) -> tuple[bytes, float]:
     return encode(cut, "PNG"), time.perf_counter() - start
 
 
+def to_data_uri(img: Image.Image, max_side: int = 1000) -> str:
+    img = img.convert("RGB").copy()
+    img.thumbnail((max_side, max_side))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+COMPARE_HTML = """
+<style>
+  body { margin: 0; padding: 12px 0 20px; background: transparent; font-family: system-ui, sans-serif; }
+  .wrap { position: relative; width: min(100%, __MAXW__px); aspect-ratio: __RATIO__; margin: 0 auto;
+          border-radius: 20px; overflow: hidden; border: 1px solid rgba(124,92,255,.35);
+          box-shadow: 0 18px 50px rgba(124,92,255,.30); animation: rise .8s cubic-bezier(.22,1,.36,1) both; }
+  .wrap img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
+              user-select: none; pointer-events: none; }
+  #after { clip-path: inset(0 0 0 100%); }
+  .line { position: absolute; top: 0; bottom: 0; left: 100%; width: 3px; transform: translateX(-50%);
+          background: linear-gradient(#ff4d8d, #7c5cff, #22d3ee); box-shadow: 0 0 18px #ff4d8d; pointer-events: none; }
+  .knob { position: absolute; top: 50%; left: 100%; width: 48px; height: 48px; border-radius: 50%;
+          transform: translate(-50%, -50%); display: flex; align-items: center; justify-content: center;
+          color: #fff; font-size: 20px; font-weight: 800; pointer-events: none;
+          background: linear-gradient(135deg, #ff4d8d, #7c5cff);
+          box-shadow: 0 0 0 5px rgba(255,255,255,.18), 0 10px 30px rgba(0,0,0,.45); }
+  .tag { position: absolute; top: 14px; padding: 5px 12px; border-radius: 999px; font-size: 11px; font-weight: 800;
+         letter-spacing: .12em; color: #fff; background: rgba(11,10,26,.6); backdrop-filter: blur(6px); pointer-events: none; }
+  .tag.l { left: 14px; } .tag.r { right: 14px; }
+  input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: ew-resize; }
+  @keyframes rise { from { opacity: 0; transform: translateY(20px) scale(.98); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { .wrap { animation: none; } }
+</style>
+<div class="wrap">
+  <img src="__BEFORE__" alt="Before">
+  <img id="after" src="__AFTER__" alt="After">
+  <div class="line" id="l"></div>
+  <div class="knob" id="k">⇆</div>
+  <span class="tag l">BEFORE</span><span class="tag r">AFTER</span>
+  <input type="range" min="0" max="100" step="0.1" value="100" id="s" aria-label="Compare before and after">
+</div>
+<script>
+  const s = document.getElementById("s"), a = document.getElementById("after"),
+        l = document.getElementById("l"), k = document.getElementById("k");
+  function set(v) { a.style.clipPath = `inset(0 0 0 ${v}%)`; l.style.left = v + "%"; k.style.left = v + "%"; }
+  s.addEventListener("input", e => set(e.target.value));
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (__ANIMATE__ && !reduce) {
+    let start = null;
+    const sweep = ts => {
+      if (!start) start = ts;
+      const p = Math.min((ts - start) / 1600, 1);
+      const v = 100 - 50 * (1 - Math.pow(1 - p, 3));
+      s.value = v; set(v);
+      if (p < 1) requestAnimationFrame(sweep);
+    };
+    setTimeout(() => requestAnimationFrame(sweep), 350);
+  } else { s.value = 50; set(50); }
+</script>
+"""
+
+
+def compare_slider(before: Image.Image, after: Image.Image, animate: bool, height: int = 520) -> None:
+    """Interactive before/after slider that sweeps open when a new photo arrives."""
+    w, h = after.size
+    before = before.convert("RGB").copy()
+    before.thumbnail((2000, 2000))
+    before = ImageOps.pad(before, (w, h), color=(22, 20, 43))
+    page = (
+        COMPARE_HTML.replace("__BEFORE__", to_data_uri(before))
+        .replace("__AFTER__", to_data_uri(after))
+        .replace("__RATIO__", f"{w} / {h}")
+        .replace("__MAXW__", str(int(height * w / h)))
+        .replace("__ANIMATE__", "true" if animate else "false")
+    )
+    components.html(page, height=height + 40)
+
+
+load_css()
+
 # ---------- Sidebar: settings ----------
 with st.sidebar:
-    st.markdown("### 🎛️ Studio settings")
+    html('<div class="side-title">🎛️ Studio settings</div>')
     preset_name = st.selectbox("Export for", list(studio.PRESETS))
     preset = studio.PRESETS[preset_name]
     st.caption(preset.note)
@@ -91,19 +175,20 @@ settings = dict(
     fill=fill, shadow=shadow, enhance=enhance, clean_edges=clean,
 )
 
-# ---------- Header ----------
-st.markdown(
-    """
-<div class="hero">
-  <div class="hero-title">📸 Product Photo Studio</div>
-  <p class="hero-sub">Turn casual phone photos into clean, marketplace-ready product shots in seconds.</p>
-  <span class="pill">🤖 AI background removal</span>
-  <span class="pill">🛒 Marketplace &amp; social presets</span>
-  <span class="pill">🌗 Studio shadows &amp; reflections</span>
-  <span class="pill">📦 Batch export</span>
-</div>
-""",
-    unsafe_allow_html=True,
+# ---------- Hero ----------
+html(
+    '<div class="hero">'
+    '<div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div>'
+    '<div class="hero-content">'
+    '<div class="eyebrow">AI · E-COMMERCE · STUDIO</div>'
+    '<div class="hero-title"><span class="cam">📸</span> Product Photo <span class="grad">Studio</span></div>'
+    '<p class="hero-sub">Turn casual phone photos into clean, marketplace-ready product shots in seconds.</p>'
+    '<div class="pills">'
+    '<span class="pill">🤖 AI background removal</span>'
+    '<span class="pill">🛒 Marketplace &amp; social presets</span>'
+    '<span class="pill">🌗 Studio shadows &amp; reflections</span>'
+    '<span class="pill">📦 Batch export</span>'
+    "</div></div></div>"
 )
 
 single_tab, batch_tab, about_tab = st.tabs(["✨ Single photo", "📦 Batch mode", "🧠 How it works"])
@@ -112,27 +197,28 @@ single_tab, batch_tab, about_tab = st.tabs(["✨ Single photo", "📦 Batch mode
 with single_tab:
     up = st.file_uploader("Upload a product photo", type=IMAGE_TYPES, key="single")
     if up is None:
-        st.info(
-            "👆 Upload a photo to start. Best results: one product, good light, "
-            "and a background that contrasts with the product."
-        )
+        html(cards([
+            ("01", "⬆️", "Upload", "Any phone photo of a single product."),
+            ("02", "🤖", "AI cut-out", "The background is removed and edges are cleaned automatically."),
+            ("03", "🎨", "Style", "Pick a backdrop, shadow and export preset. The preview updates live."),
+            ("04", "⬇️", "Export", "Download a marketplace-ready image, or a whole batch as a ZIP."),
+        ]))
     else:
+        data = up.getvalue()
+        digest = hashlib.md5(data).hexdigest()
         try:
             with st.spinner("Cutting out your product with AI… (the first run downloads the model)"):
-                cut_bytes, secs = cutout_png(up.getvalue(), model)
+                cut_bytes, secs = cutout_png(data, model)
         except ValueError as err:
             st.error(str(err))
         else:
             cut = Image.open(io.BytesIO(cut_bytes))
             result = studio.compose(cut, **settings)
 
-            before, after = st.columns(2, gap="large")
-            with before:
-                st.markdown('<div class="frame-label">Before</div>', unsafe_allow_html=True)
-                st.image(ImageOps.exif_transpose(Image.open(up)))
-            with after:
-                st.markdown('<div class="frame-label">After</div>', unsafe_allow_html=True)
-                st.image(result)
+            animate = st.session_state.get("last_photo") != digest
+            st.session_state["last_photo"] = digest
+            original = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+            compare_slider(original, result, animate)
 
             m1, m2, m3 = st.columns(3)
             m1.metric("AI cut-out time", f"{secs:.1f} s")
@@ -142,11 +228,11 @@ with single_tab:
             d1, d2 = st.columns(2)
             d1.download_button(
                 "⬇️ Download studio shot", encode(result, out_fmt),
-                file_name=f"studio-shot.{ext}", mime=mime, type="primary",
+                file_name=f"studio-shot.{ext}", mime=mime, type="primary", use_container_width=True,
             )
             d2.download_button(
                 "⬇️ Transparent cut-out (PNG)", cut_bytes,
-                file_name="cutout.png", mime="image/png",
+                file_name="cutout.png", mime="image/png", use_container_width=True,
             )
 
 # ---------- Batch mode ----------
@@ -197,27 +283,30 @@ with batch_tab:
 
 # ---------- How it works ----------
 with about_tab:
+    html('<div class="section-title">The pipeline</div>')
+    html(cards([
+        ("01", "🧭", "Orientation fix", "Reads the photo's EXIF data so phone photos are never sideways."),
+        ("02", "🤖", "AI segmentation", "A U²-Net or IS-Net model (via rembg on ONNX Runtime) separates the product from the background."),
+        ("03", "✂️", "Edge clean-up", "The mask is tightened and softened to remove halos."),
+        ("04", "📐", "Smart framing", "The product is trimmed to its bounds and scaled for each export preset."),
+        ("05", "🌗", "Studio compositing", "Backdrop plus a contact shadow, drop shadow or fading floor reflection."),
+        ("06", "📦", "Export", "PNG or high-quality JPEG, one at a time or as a ZIP."),
+    ]))
+    html('<div class="section-title">Engineering notes</div>')
     st.markdown(
-        """
-#### The pipeline
-1. **Orientation fix**: reads the photo's EXIF data so phone photos are never sideways.
-2. **AI segmentation**: a U²-Net or IS-Net model (via `rembg`, running on ONNX Runtime) separates the product from the background.
-3. **Edge clean-up**: the mask is tightened and softened to remove halos.
-4. **Smart framing**: the product is trimmed to its bounds and scaled to fill the right share of the frame for each export preset.
-5. **Studio compositing**: backdrop, contact or drop shadow, or a fading floor reflection is added.
-6. **Export**: PNG or high-quality JPEG, one at a time or as a ZIP.
-
-#### Engineering notes
-- The slow AI step is **cached per photo**, so changing settings re-renders instantly.
-- Image logic lives in `studio.py`, separate from the UI, so it can be tested and reused.
-- Runs entirely on CPU, with no GPU and no paid APIs.
-
-**Built with** Python · Streamlit · rembg · ONNX Runtime · Pillow
-"""
+        "- The slow AI step is **cached per photo**, so changing settings re-renders instantly.\n"
+        "- Image logic lives in `studio.py`, separate from the UI, so it can be tested and reused.\n"
+        "- Runs entirely on CPU, with no GPU and no paid APIs.\n"
+        "- Animations switch off automatically for users who prefer reduced motion."
+    )
+    html(
+        '<div class="section-title">Built with</div><div>'
+        '<span class="chip">🐍 Python</span><span class="chip">🎈 Streamlit</span>'
+        '<span class="chip">✂️ rembg</span><span class="chip">⚙️ ONNX Runtime</span>'
+        '<span class="chip">🖼️ Pillow</span></div>'
     )
 
-st.markdown(
+html(
     '<div class="footer">Built by <a href="https://github.com/jaidheervemula">Jaidheer Vemula</a> · '
-    '<a href="https://github.com/jaidheervemula/product-photo-studio">Source on GitHub</a></div>',
-    unsafe_allow_html=True,
+    '<a href="https://github.com/jaidheervemula/product-photo-studio">Source on GitHub</a></div>'
 )
