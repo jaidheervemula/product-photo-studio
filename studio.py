@@ -70,24 +70,57 @@ def make_backdrop(name: str, size: tuple[int, int], custom_color: str = "#ffffff
     return BACKDROPS[name](size)
 
 
-def isolate_main_object(cutout: Image.Image, min_alpha: int = 40, keep_ratio: float = 0.25) -> Image.Image:
-    """Drop stray objects and faint haze, keeping the main product.
+def isolate_main_object(cutout: Image.Image, min_alpha: int = 40, keep_ratio: float = 0.5) -> Image.Image:
+    """Keep the main product and drop stray objects (a mouse, a cable) and background haze.
 
-    Keeps the largest solid region plus any region at least `keep_ratio` of its size,
-    so pairs (e.g. earrings) survive but small extras (a mouse, a cable) are removed.
+    1. Erode the mask so objects joined by thin bridges (cables, shadows, haze) separate.
+    2. Score each blob by size and closeness to the photo's centre; keep the winner,
+       plus any similar-sized blob near the centre (so pairs like earrings survive).
+    3. Give every original mask pixel to its nearest blob and keep the chosen blobs' pixels,
+       which restores the product's exact outline, including thin parts like straps.
     """
     import numpy as np
     from scipy import ndimage
 
     alpha = np.array(cutout.getchannel("A"))
     solid = alpha > 128
-    labels, count = ndimage.label(solid)
+    if not solid.any():
+        return cutout
+    h, w = solid.shape
+
+    # 1) Break thin bridges. Try a strong erosion first; fall back to gentler ones
+    #    so very thin products (pens, chains) don't disappear completely.
+    structure = np.ones((3, 3), dtype=bool)
+    radius = max(2, int(max(h, w) * 0.012))
+    core = solid
+    for r in (radius, radius // 2, 1):
+        eroded = ndimage.binary_erosion(solid, structure=structure, iterations=max(1, r))
+        if eroded.any():
+            core = eroded
+            break
+
+    labels, count = ndimage.label(core)
     if count == 0:
         return cutout
-    sizes = ndimage.sum(solid, labels, range(1, count + 1))
-    keep_ids = [i + 1 for i, s in enumerate(sizes) if s >= sizes.max() * keep_ratio]
-    keep = np.isin(labels, keep_ids)
-    keep = ndimage.binary_dilation(keep, iterations=3)  # keep the soft edge pixels around it
+    ids = np.arange(1, count + 1)
+    sizes = np.asarray(ndimage.sum(core, labels, ids), dtype=float)
+    centres = np.asarray(ndimage.center_of_mass(core, labels, ids), dtype=float).reshape(-1, 2)
+
+    # 2) Big and central wins. dist is 0 at the centre and about 0.7 in a corner.
+    dist = np.hypot((centres[:, 1] - w / 2) / w, (centres[:, 0] - h / 2) / h)
+    score = sizes * (1.0 - dist)
+    best = int(np.argmax(score))
+    keep_ids = [best + 1] + [
+        i + 1 for i in range(count)
+        if i != best and sizes[i] >= sizes[best] * keep_ratio and dist[i] < 0.35
+    ]
+
+    # 3) Assign every pixel to its nearest blob, then keep only the chosen blobs' pixels.
+    _, (iy, ix) = ndimage.distance_transform_edt(labels == 0, return_indices=True)
+    nearest = labels[iy, ix]
+    keep = solid & np.isin(nearest, keep_ids)
+    keep = ndimage.binary_dilation(keep, structure=structure, iterations=2)  # keep soft edge pixels
+
     alpha = np.where(keep & (alpha >= min_alpha), alpha, 0).astype(np.uint8)
     out = cutout.copy()
     out.putalpha(Image.fromarray(alpha))
