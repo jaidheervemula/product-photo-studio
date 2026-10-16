@@ -99,22 +99,59 @@ def ai_mask(image: Image.Image, session) -> Image.Image:
     return _fit_mask(remove(image, session=session, only_mask=True), image.size)
 
 
-def sam_mask(image: Image.Image, session, points) -> Image.Image:
-    """Mask of the object the user clicked, from Segment Anything.
+def click_mask(image: Image.Image, base: Image.Image, points, work_side: int = 640) -> Image.Image:
+    """Turn the user's clicks into a selection with random-walker segmentation.
 
-    `points` are (x, y, label) in image pixels; label 1 = keep, 0 = remove.
+    Clicks are seeds: label 1 = keep, 0 = remove. Everything outside the AI mask is
+    also seeded as "remove". The random walker spreads the seeds across the photo and
+    stops at strong colour edges, which separates touching objects (a book and a mouse).
+    It runs on a downscaled copy, so it is fast and needs no extra model download.
     """
-    from rembg import remove
+    import numpy as np
+    from scipy import ndimage
+    from skimage.segmentation import random_walker
 
-    prompt = [{"type": "point", "data": [int(x), int(y)], "label": int(label)} for x, y, label in points]
-    return _fit_mask(remove(image, session=session, only_mask=True, sam_prompt=prompt), image.size)
+    w, h = image.size
+    s = min(1.0, work_side / max(w, h))
+    sw, sh = max(1, round(w * s)), max(1, round(h * s))
+    small = np.asarray(image.convert("RGB").resize((sw, sh), Image.BILINEAR), dtype=np.float64) / 255.0
+    foreground = np.asarray(base.convert("L").resize((sw, sh), Image.BILINEAR)) > 30
+
+    seeds = np.zeros((sh, sw), dtype=np.int32)
+    seeds[~foreground] = 2  # outside the AI mask is background for sure
+    yy, xx = np.mgrid[0:sh, 0:sw]
+    radius = max(3, int(max(sw, sh) * 0.02))
+    keep_spots = []
+    for x, y, label in points:
+        cx, cy = x * s, y * s
+        seeds[(xx - cx) ** 2 + (yy - cy) ** 2 <= radius ** 2] = 1 if label == 1 else 2
+        if label == 1:
+            keep_spots.append((min(sh - 1, int(cy)), min(sw - 1, int(cx))))
+
+    if not (seeds == 1).any():
+        return base.convert("L")
+    if (seeds == 0).any() and (seeds == 2).any():
+        seg = random_walker(small, seeds, beta=130, mode="cg_j", channel_axis=-1)
+    else:
+        seg = np.where(seeds == 2, 2, 1)
+    selected = seg == 1
+
+    # Keep only the regions that actually contain a "keep" click.
+    regions, _ = ndimage.label(selected)
+    keep_ids = {int(regions[r, c]) for r, c in keep_spots} - {0}
+    if keep_ids:
+        selected = np.isin(regions, list(keep_ids))
+
+    mask = Image.fromarray((selected * 255).astype(np.uint8), mode="L")
+    mask = mask.resize((w, h), Image.BILINEAR)  # smooth upscale; thresholded later
+    return mask
 
 
-def combine_masks(base: Image.Image, selection: Image.Image, grow: int = 6) -> Image.Image:
-    """Hybrid mask: SAM decides WHAT the product is, the matting model decides WHERE its edges are.
+def combine_masks(base: Image.Image, selection: Image.Image, grow_out: int = 4, grow_in: int = 8) -> Image.Image:
+    """Hybrid mask: the selection decides WHAT the product is, the AI mask decides WHERE its edges are.
 
-    Near the selection's border we keep the matting model's fine edge; deep inside the
-    selection we force full opacity, filling any holes the matting model left.
+    Just around the selection's border we keep the AI mask's fine edge; deep inside the
+    selection we force full opacity, filling any holes the AI mask left.
     """
     import numpy as np
     from scipy import ndimage
@@ -122,8 +159,8 @@ def combine_masks(base: Image.Image, selection: Image.Image, grow: int = 6) -> I
     sel = np.array(selection) > 127
     if not sel.any():
         return base
-    near = ndimage.binary_dilation(sel, iterations=grow)
-    core = ndimage.binary_erosion(sel, iterations=grow)
+    near = ndimage.binary_dilation(sel, iterations=grow_out)
+    core = ndimage.binary_erosion(sel, iterations=grow_in)
     alpha = np.array(base)
     alpha = np.where(near, alpha, 0)
     alpha = np.where(core, 255, alpha).astype(np.uint8)
